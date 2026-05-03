@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import typing as t
 from importlib import resources
 
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 
 from singer_sdk import typing as th, metrics
+from singer_sdk.exceptions import RetriableAPIError
 
 if t.TYPE_CHECKING:
     import requests
@@ -88,6 +90,29 @@ class ReportsStream(ApplovinStream):
             yield interval_start, interval_end
             current_date = interval_end
 
+    def validate_response(self, response: requests.Response) -> None:
+        """Validate HTTP response, raising retriable errors with appropriate wait on 429.
+
+        Args:
+            response: The HTTP response object.
+
+        Raises:
+            RetriableAPIError: On 429 Too Many Requests, with Retry-After respected.
+            FatalAPIError: On unrecoverable errors.
+        """
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            self.logger.warning(
+                "Rate limited by AppLovin API. Waiting %d seconds before retry.",
+                retry_after,
+            )
+            time.sleep(retry_after)
+            raise RetriableAPIError(
+                f"429 Client Error: Too Many Requests (waited {retry_after}s)",
+                response,
+            )
+        super().validate_response(response)
+
     def get_url_params(
         self,
         context: Context | None,  # noqa: ARG002
@@ -113,7 +138,7 @@ class ReportsStream(ApplovinStream):
             params["sort"] = "asc"
             params["order_by"] = self.replication_key
         return params
-    
+
     def prepare_request(
         self,
         context: Context | None,
@@ -158,7 +183,7 @@ class ReportsStream(ApplovinStream):
             prepare_kwargs["data"] = request_data
 
         return self.build_prepared_request(**prepare_kwargs)
-    
+
     def request_records(self, context: Context | None) -> t.Iterable[dict]:
         """Request records from REST endpoint(s), returning response records.
 
@@ -189,7 +214,7 @@ class ReportsStream(ApplovinStream):
                     interval_start=interval_start,
                     interval_end=interval_end
                 )
-                
+
                 resp = decorated_request(prepared_request, context)
                 request_counter.increment()
                 self.update_sync_costs(prepared_request, resp, context)
@@ -208,3 +233,5 @@ class ReportsStream(ApplovinStream):
 
                 paginator.advance(resp)
 
+            # Sleep between daily intervals to avoid hammering the API
+            time.sleep(2)
